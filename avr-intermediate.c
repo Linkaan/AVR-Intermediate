@@ -39,12 +39,20 @@
 #include <string.h>
 #include <errno.h>
 
+#include <wiringPi/wiringSerial.h>
+
 #include <events.h>
 #include <fgevents.h>
 #include <event2/event.h>
 
+#define UNIX_SOCKET_PATH "/tmp/fg.socket"
+
 /* Forward declarations used in this file. */
-static int fg_event_handler (unsigned char *, size_t, unsigned char *);
+static void fg_event_handler (unsigned char *, size_t, void *);
+static int read_fgevent_from_serial (unsigned char *, int);
+
+/* Pipe used to notify threads to exit from signal handler */
+int exitpipe[2];
 
 /* Signal handler for SIGINT, SIGHUP and SIGTERM */
 static void
@@ -91,25 +99,80 @@ handle_signals ()
 int
 main (void)
 {
-	ssize_t s;
+	ssize_t s, events;
     int fd;
+    struct pollfd poll_fds[2];
     struct fg_events_data etdata;
 
     handle_signals ();
 
-    /* TODO: try connecting over serial to AVR */
+    s = wiringPiSetup ();
+    if (s < 0)
+      {
+        perror ("error in wiringPiSetup");
+        return 1;
+      }
+
+    s = serialOpen ("/dev/ttyAMA0", 9600);
+    if (s < 0)
+      {
+        perror ("error in serialOpen");
+        return 1;
+      }
+    fd = s;
+
+    /* Create a pipe used to singal all threads to begin shutdown sequence */
+    s = pipe (exitpipe);
+    if (s < 0)
+      {
+        perror ("error creating pipe");
+        return 1;
+      }
 
     etdata.fg_event_handler = &fg_event_handler;
-    s = fg_events_client_init_inet (&etdata, NULL, fd,
-                                    MASTER_IP, MASTER_PORT);
+    s = fg_events_client_init_unix (&etdata, NULL, fd,
+                                    UNIX_SOCKET_PATH, FG_AVR);
     if (s != 0)
       {
         perror ("error initializing fgevents");
         return 1;
       }
 
-    /* TODO: poll on serial fd for any incoming data and send it to
-     * master without doing any further processing here */
+    poll_fds[0].fd = fd;
+    poll_fds[0].revents = 0;
+    poll_fds[0].events = events = POLLIN | POLLPRI;
+
+    poll_fds[1] = poll_fds[0];
+    poll_fds[1].fd = exitpipe[0];
+
+    while (1)
+      {
+        s = poll (poll_fds, 2, -1);
+
+        if (s < 0)
+            perror ("poll failed");
+        else if (s > 0)
+          {
+            if (poll_fds[1].revents & events)
+              {
+                /* exit program */
+                break;
+              }
+            else if (poll_fds[0].revents & events)
+              {
+                unsigned char *serial_buf;
+                s = read_fgevent_from_serial (serial_buf, fd);
+
+                if (s < 0)
+                    perror ("error in read_fgevent_from_serial");
+                else if (s > 0)
+                  {
+                    fg_send_data (&etdata, serial_buf, s);
+                    free (serial_buf);
+                  }
+              }
+          }
+      }
 
     /* **************************************************************** */
     /*                                                                  */
@@ -123,7 +186,83 @@ main (void)
 }
 
 static int
-fg_handle_event (unsigned char *buffer, size_t len, unsigned char *p)
+read_fgevent_from_serial (unsigned char *serial_buf, int fd)
 {
-    /* TODO: implement writing event serialized directly to avr
+    size_t serial_size;
+    int c, serial_pos;
+    unsigned char header_buf[FGEVENT_HEADER_SIZE];
+    struct fgevent header;
+
+    do
+      {
+        c = serialGetchar (fd);
+      }
+    while (c > -1 && c != 0x02);
+
+    if (c < 0) return 0;
+
+    for (int i = 0; i < FGEVENT_HEADER_SIZE; í++)
+      {
+        c = serialGetchar (fd);
+        if (c < 0) break;
+
+        header_buf[i] = (unsigned char) c;
+      }
+
+    if (c < 0) return 0;
+
+    deserialize_fgevent_header (header_buf, &header);
+
+    serial_size = 1 + FGEVENT_HEADER_SIZE + header.length + 1;
+    serial_buf = malloc (serial_size);
+    if (serial_buf == NULL)
+      {
+        for (int i = 0; i < header.length + 1; i++)
+          {
+            c = serialGetchar (fd);
+            if (c < 0) break;
+          }
+        return -1;
+      }
+
+    serial_buf[0] = 0x02;
+    for (serial_pos = 0; serial_pos < serial_size - 2; serial_pos++)
+      {
+        if (serial_pos < FGEVENT_HEADER_SIZE)
+          {
+            serial_buf[serial_pos] = header_buf[serial_pos];
+            continue;
+          }
+
+        c = serialGetchar (fd);
+        if (c < 0) break;
+
+        serial_buf[serial_pos] = (unsigned char) c;
+      }
+    serial_buf[serial_pos] = 0x03;
+
+    if (c < 0)
+      {
+        free (serial_buf);
+        return 0;
+      }
+
+    do
+      {
+        c = serialGetchar (fd);
+      }
+    while (c > -1 && c != 0x03);
+
+    return serial_size;
+}
+
+static void
+fg_event_handler (unsigned char *buffer, size_t len, void *arg)
+{
+    int fd = arg;
+
+    for (int i = 0; i < len; i++)
+      {
+        serialPutchar (fd, buffer[i]);
+      }
 }
