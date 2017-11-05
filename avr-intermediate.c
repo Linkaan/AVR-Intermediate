@@ -28,6 +28,7 @@
 #include <semaphore.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sys/timerfd.h>
 #include <sys/eventfd.h>
 #include <fcntl.h>
@@ -39,6 +40,7 @@
 #include <string.h>
 #include <errno.h>
 
+#include <wiringPi/wiringPi.h>
 #include <wiringPi/wiringSerial.h>
 
 #include <events.h>
@@ -48,8 +50,13 @@
 #define UNIX_SOCKET_PATH "/tmp/fg.socket"
 
 /* Forward declarations used in this file. */
-static void fg_event_handler (unsigned char *, size_t, void *);
-static int read_fgevent_from_serial (unsigned char *, int);
+static void fg_event_handler (struct fgevent *, int);
+static int read_fgevent_from_serial (unsigned char **, int);
+
+struct thread_data {
+    struct fg_events_data etdata;
+    int                   fd;
+};
 
 /* Pipe used to notify threads to exit from signal handler */
 int exitpipe[2];
@@ -96,13 +103,40 @@ handle_signals ()
         sigaction (SIGTERM, &new_action, NULL);
 }
 
+static int
+fgevent_callback (void *arg, struct fgevent *fgev,
+                  struct fgevent * UNUSED(ansev))
+{
+    struct thread_data *tdata = arg;
+
+    /* Handle error in fgevent */
+    if (fgev == NULL)
+      {
+        printf ("error [%s] says %s\n", strerror (tdata->etdata.save_errno), tdata->etdata.error);
+        return 0;
+      }
+
+    switch (fgev->id) 
+      {
+        case FG_CONFIRMED:
+        case FG_ALIVE:
+          break;
+        default:
+          printf ("got %d event\n", fgev->id);
+          fg_event_handler (fgev, tdata->fd);
+          break;    
+      }
+
+    return 0;
+}
+
 int
 main (void)
 {
-	ssize_t s, events;
+    ssize_t s, events;
     int fd;
     struct pollfd poll_fds[2];
-    struct fg_events_data etdata;
+    struct thread_data tdata;
 
     handle_signals ();
 
@@ -129,13 +163,13 @@ main (void)
         return 1;
       }
 
-    etdata.fg_event_handler = &fg_event_handler;
-    s = fg_events_client_init_unix (&etdata, NULL, fd,
+    tdata.fd = fd;
+    s = fg_events_client_init_unix (&tdata.etdata, &fgevent_callback, NULL, &tdata,
                                     UNIX_SOCKET_PATH, FG_AVR);
     if (s != 0)
       {
+        errno = s;
         perror ("error initializing fgevents");
-        return 1;
       }
 
     poll_fds[0].fd = fd;
@@ -161,13 +195,13 @@ main (void)
             else if (poll_fds[0].revents & events)
               {
                 unsigned char *serial_buf;
-                s = read_fgevent_from_serial (serial_buf, fd);
+                s = read_fgevent_from_serial (&serial_buf, fd);
 
                 if (s < 0)
                     perror ("error in read_fgevent_from_serial");
                 else if (s > 0)
                   {
-                    fg_send_data (&etdata, serial_buf, s);
+                    fg_send_data (&tdata.etdata, serial_buf, s);
                     free (serial_buf);
                   }
               }
@@ -180,17 +214,17 @@ main (void)
     /*                                                                  */
     /* **************************************************************** */
 
-    fg_events_client_shutdown (&etdata);
+    fg_events_client_shutdown (&tdata.etdata);
 
     return 0;
 }
 
 static int
-read_fgevent_from_serial (unsigned char *serial_buf, int fd)
+read_fgevent_from_serial (unsigned char **serial_buf_ret, int fd)
 {
     size_t serial_size;
     int c, serial_pos;
-    unsigned char header_buf[FGEVENT_HEADER_SIZE];
+    unsigned char header_buf[FGEVENT_HEADER_SIZE], *serial_buf;
     struct fgevent header;
 
     do
@@ -201,7 +235,7 @@ read_fgevent_from_serial (unsigned char *serial_buf, int fd)
 
     if (c < 0) return 0;
 
-    for (int i = 0; i < FGEVENT_HEADER_SIZE; í++)
+    for (int i = 0; i < FGEVENT_HEADER_SIZE; i++)
       {
         c = serialGetchar (fd);
         if (c < 0) break;
@@ -213,7 +247,9 @@ read_fgevent_from_serial (unsigned char *serial_buf, int fd)
 
     deserialize_fgevent_header (header_buf, &header);
 
-    serial_size = 1 + FGEVENT_HEADER_SIZE + header.length + 1;
+    printf ("received %d event from avr\n", header.id);
+
+    serial_size = 1 + FGEVENT_HEADER_SIZE + header.length * sizeof (header.payload[0]) + 1;
     serial_buf = malloc (serial_size);
     if (serial_buf == NULL)
       {
@@ -226,11 +262,11 @@ read_fgevent_from_serial (unsigned char *serial_buf, int fd)
       }
 
     serial_buf[0] = 0x02;
-    for (serial_pos = 0; serial_pos < serial_size - 2; serial_pos++)
+    for (serial_pos = 1; serial_pos < (ssize_t) serial_size - 2; serial_pos++)
       {
-        if (serial_pos < FGEVENT_HEADER_SIZE)
+        if (serial_pos < FGEVENT_HEADER_SIZE+1)
           {
-            serial_buf[serial_pos] = header_buf[serial_pos];
+            serial_buf[serial_pos] = header_buf[serial_pos-1];
             continue;
           }
 
@@ -239,7 +275,7 @@ read_fgevent_from_serial (unsigned char *serial_buf, int fd)
 
         serial_buf[serial_pos] = (unsigned char) c;
       }
-    serial_buf[serial_pos] = 0x03;
+    serial_buf[serial_pos+1] = 0x03;
 
     if (c < 0)
       {
@@ -253,16 +289,25 @@ read_fgevent_from_serial (unsigned char *serial_buf, int fd)
       }
     while (c > -1 && c != 0x03);
 
+    *serial_buf_ret = serial_buf;
+
     return serial_size;
 }
 
 static void
-fg_event_handler (unsigned char *buffer, size_t len, void *arg)
+fg_event_handler (struct fgevent *fgev, int fd)
 {
-    int fd = arg;
+    ssize_t s;
+    unsigned char *fgbuf;    
+    
+    s = create_serialized_fgevent_buffer (&fgbuf, fgev);
+    if (s < 0)
+        return;
 
-    for (int i = 0; i < len; i++)
+    for (int i = 0; i < s; i++)
       {
-        serialPutchar (fd, buffer[i]);
+        serialPutchar (fd, fgbuf[i]);
       }
+
+    free (fgbuf);
 }

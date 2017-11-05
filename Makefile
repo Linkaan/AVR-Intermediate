@@ -27,7 +27,7 @@ CFLAGS := $(INCLUDE) -std=gnu11 -g -Wall -Wextra -D _GNU_SOURCE
 LDFLAGS := $(LINKS) -lwiringPi -lpthread -lfg-events -lfg-serializer -levent\
 -levent_pthreads
 SOURCES := avr-intermediate.c
-HEADERS := 
+HEADERS := dummy.h
 OBJECTS=$(SOURCES:.c=.o)
 EXECUTABLE := avr-intermediate
 
